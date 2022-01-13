@@ -901,9 +901,7 @@ contract MSC is Context, IERC20, Ownable {
     mapping(address => uint256) private _rOwned;
     mapping(address => uint256) private _tOwned;
     mapping(address => mapping(address => uint256)) private _allowances;
-
     mapping(address => bool) private _isExcludedFromFee;
-
     mapping(address => bool) private _isExcluded;
     address[] private _excluded;
 
@@ -912,11 +910,10 @@ contract MSC is Context, IERC20, Ownable {
     uint256 private _rTotal = (MAX - (MAX % TOTAL));
     uint256 private _tFeeTotal;
     uint256 public _maxTxAmount = 1 * 10**6 * 10**9;
-    uint256 private minimumTokensBeforeSwap = 1 * 10**6 * 10**9;
+    uint256 private _minimumTokensBeforeSwap = 1 * 10**6 * 10**9;
 
     string private constant NAME = "MultiStrategiesCapital";
     string private constant SYMBOL = "MSC";
-
     uint8 private constant DECIMALS = 9;
     uint8 private _fundAllocation = 27;
     uint8 private _liquidityAllocation = 27;
@@ -928,9 +925,20 @@ contract MSC is Context, IERC20, Ownable {
     bool inSwap = false;
     bool public swapEnabled = false;
 
-    IUniswapV2Router02 public immutable uniswapV2Router;
-    address public uniswapV2Pair;
+    IUniswapV2Router02 public immutable _uniswapV2Router;
     mapping(address => bool) private _isUniswapPair;
+
+    event SwapEnabled(bool enabled);
+    event AddUniswapV2Pair(address pairAddress);
+    event RemoveUniswapV2Pair(address pairAddress);
+    event WalletAddressUpdated(string name, address walletAddress);
+    event FeeUpdated(string name, uint8 value);
+    event Share(address sender, uint256 amount);
+    event ExcludeAccount(address account);
+    event IncludeAccount(address account);
+    event ExcludeAccountFromFee(address account, bool isExcluded);
+    event MaxTxAmountUpdated(uint256 amount);
+    event MinimumTokensBeforeSwapUpdated(uint256 amount);
 
     modifier lockTheSwap() {
         inSwap = true;
@@ -940,7 +948,7 @@ contract MSC is Context, IERC20, Ownable {
 
     constructor() {
         _rOwned[_msgSender()] = _rTotal;
-        uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
+        _uniswapV2Router = IUniswapV2Router02(0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D);
         _isExcludedFromFee[owner()] = true;
         _isExcludedFromFee[address(this)] = true;
         _isExcludedFromFee[_fundWalletAddress] = true;
@@ -1017,35 +1025,37 @@ contract MSC is Context, IERC20, Ownable {
 
     function setExcludeFromFee(address account, bool excluded) external onlyOwner {
         _isExcludedFromFee[account] = excluded;
+        emit ExcludeAccountFromFee(account, excluded);
     }
 
     function totalFees() external view returns (uint256) {
         return _tFeeTotal;
     }
 
-    function deliver(uint256 tAmount) public {
+    function share(uint256 tAmount) external {
         address sender = _msgSender();
         require(!_isExcluded[sender], "Excluded addresses cannot call this function");
-        (uint256 rAmount, , , , , ) = _getValues(tAmount);
+        (uint256 rAmount, , , , , ) = getValues(tAmount);
         _rOwned[sender] = _rOwned[sender].sub(rAmount);
         _rTotal = _rTotal.sub(rAmount);
         _tFeeTotal = _tFeeTotal.add(tAmount);
+        emit Share(sender, rAmount);
     }
 
     function reflectionFromToken(uint256 tAmount, bool deductTransferFee) external view returns (uint256) {
         require(tAmount <= TOTAL, "Amount must be less than supply");
         if (!deductTransferFee) {
-            (uint256 rAmount, , , , , ) = _getValues(tAmount);
+            (uint256 rAmount, , , , , ) = getValues(tAmount);
             return rAmount;
         } else {
-            (, uint256 rTransferAmount, , , , ) = _getValues(tAmount);
+            (, uint256 rTransferAmount, , , , ) = getValues(tAmount);
             return rTransferAmount;
         }
     }
 
     function tokenFromReflection(uint256 rAmount) public view returns (uint256) {
         require(rAmount <= _rTotal, "Amount must be less than total reflections");
-        uint256 currentRate = _getRate();
+        uint256 currentRate = getRate();
         return rAmount.div(currentRate);
     }
 
@@ -1057,6 +1067,7 @@ contract MSC is Context, IERC20, Ownable {
         }
         _isExcluded[account] = true;
         _excluded.push(account);
+        emit ExcludeAccount(account);
     }
 
     function includeAccount(address account) external onlyOwner {
@@ -1070,6 +1081,7 @@ contract MSC is Context, IERC20, Ownable {
                 break;
             }
         }
+        emit IncludeAccount(account);
     }
 
     function removeAllFee() private {
@@ -1112,18 +1124,12 @@ contract MSC is Context, IERC20, Ownable {
         require(recipient != address(0), "ERC20: transfer to the zero address");
         require(amount > 0, "Transfer amount must be greater than zero");
 
-        if (!_isExcludedFromFee[sender] && !_isExcludedFromFee[recipient])
+        if (!_isExcludedFromFee[sender] && !_isExcludedFromFee[recipient]) {
             require(amount <= _maxTxAmount, "Transfer amount exceeds the maxTxAmount.");
-
-        uint256 contractTokenBalance = balanceOf(address(this));
-        if (contractTokenBalance >= _maxTxAmount) {
-            contractTokenBalance = _maxTxAmount;
         }
 
-        bool overMinTokenBalance = contractTokenBalance >= minimumTokensBeforeSwap;
-        if (
-            !inSwap && swapEnabled && overMinTokenBalance && (recipient == uniswapV2Pair || _isUniswapPair[recipient])
-        ) {
+        uint256 contractTokenBalance = balanceOf(address(this));
+        if (!inSwap && swapEnabled && contractTokenBalance >= _minimumTokensBeforeSwap && _isUniswapPair[recipient]) {
             swapTokensForEth(contractTokenBalance);
 
             uint256 contractETHBalance = address(this).balance;
@@ -1134,25 +1140,22 @@ contract MSC is Context, IERC20, Ownable {
 
         bool takeFee = false;
         if (
-            (sender == uniswapV2Pair ||
-                recipient == uniswapV2Pair ||
-                _isUniswapPair[recipient] ||
-                _isUniswapPair[sender]) && !(_isExcludedFromFee[sender] || _isExcludedFromFee[recipient])
+            (_isUniswapPair[recipient] || _isUniswapPair[sender]) &&
+            !(_isExcludedFromFee[sender] || _isExcludedFromFee[recipient])
         ) {
             takeFee = true;
         }
 
-        _tokenTransfer(sender, recipient, amount, takeFee);
+        tokenTransfer(sender, recipient, amount, takeFee);
     }
 
     function swapTokensForEth(uint256 tokenAmount) private lockTheSwap {
         address[] memory path = new address[](2);
         path[0] = address(this);
-        path[1] = uniswapV2Router.WETH();
+        path[1] = _uniswapV2Router.WETH();
 
-        _approve(address(this), address(uniswapV2Router), tokenAmount);
-
-        uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
+        _approve(address(this), address(_uniswapV2Router), tokenAmount);
+        _uniswapV2Router.swapExactTokensForETHSupportingFeeOnTransferTokens(
             tokenAmount,
             0,
             path,
@@ -1177,11 +1180,12 @@ contract MSC is Context, IERC20, Ownable {
         sendETHToTeam(contractETHBalance);
     }
 
-    function setSwapEnabled(bool enabled) external onlyOwner {
+    function setSwapEnabled(bool enabled) public onlyOwner {
         swapEnabled = enabled;
+        emit SwapEnabled(enabled);
     }
 
-    function _tokenTransfer(
+    function tokenTransfer(
         address sender,
         address recipient,
         uint256 amount,
@@ -1190,19 +1194,19 @@ contract MSC is Context, IERC20, Ownable {
         if (!takeFee) removeAllFee();
 
         if (_isExcluded[sender] && !_isExcluded[recipient]) {
-            _transferFromExcluded(sender, recipient, amount);
+            transferFromExcluded(sender, recipient, amount);
         } else if (!_isExcluded[sender] && _isExcluded[recipient]) {
-            _transferToExcluded(sender, recipient, amount);
+            transferToExcluded(sender, recipient, amount);
         } else if (_isExcluded[sender] && _isExcluded[recipient]) {
-            _transferBothExcluded(sender, recipient, amount);
+            transferBothExcluded(sender, recipient, amount);
         } else {
-            _transferStandard(sender, recipient, amount);
+            transferStandard(sender, recipient, amount);
         }
 
         if (!takeFee) restoreAllFee();
     }
 
-    function _transferStandard(
+    function transferStandard(
         address sender,
         address recipient,
         uint256 tAmount
@@ -1214,15 +1218,15 @@ contract MSC is Context, IERC20, Ownable {
             uint256 tTransferAmount,
             uint256 tFee,
             uint256 tTeam
-        ) = _getValues(tAmount);
+        ) = getValues(tAmount);
         _rOwned[sender] = _rOwned[sender].sub(rAmount);
         _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
-        _takeTeam(tTeam);
-        _reflectFee(rFee, tFee);
+        takeTeam(tTeam);
+        reflectFee(rFee, tFee);
         emit Transfer(sender, recipient, tTransferAmount);
     }
 
-    function _transferToExcluded(
+    function transferToExcluded(
         address sender,
         address recipient,
         uint256 tAmount
@@ -1234,73 +1238,73 @@ contract MSC is Context, IERC20, Ownable {
             uint256 tTransferAmount,
             uint256 tFee,
             uint256 tTeam
-        ) = _getValues(tAmount);
-        _rOwned[sender] = _rOwned[sender].sub(rAmount);
-        _tOwned[recipient] = _tOwned[recipient].add(tTransferAmount);
-        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
-        _takeTeam(tTeam);
-        _reflectFee(rFee, tFee);
-        emit Transfer(sender, recipient, tTransferAmount);
-    }
-
-    function _transferFromExcluded(
-        address sender,
-        address recipient,
-        uint256 tAmount
-    ) private {
-        (
-            uint256 rAmount,
-            uint256 rTransferAmount,
-            uint256 rFee,
-            uint256 tTransferAmount,
-            uint256 tFee,
-            uint256 tTeam
-        ) = _getValues(tAmount);
-        _tOwned[sender] = _tOwned[sender].sub(tAmount);
-        _rOwned[sender] = _rOwned[sender].sub(rAmount);
-        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
-        _takeTeam(tTeam);
-        _reflectFee(rFee, tFee);
-        emit Transfer(sender, recipient, tTransferAmount);
-    }
-
-    function _transferBothExcluded(
-        address sender,
-        address recipient,
-        uint256 tAmount
-    ) private {
-        (
-            uint256 rAmount,
-            uint256 rTransferAmount,
-            uint256 rFee,
-            uint256 tTransferAmount,
-            uint256 tFee,
-            uint256 tTeam
-        ) = _getValues(tAmount);
-        _tOwned[sender] = _tOwned[sender].sub(tAmount);
+        ) = getValues(tAmount);
         _rOwned[sender] = _rOwned[sender].sub(rAmount);
         _tOwned[recipient] = _tOwned[recipient].add(tTransferAmount);
         _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
-        _takeTeam(tTeam);
-        _reflectFee(rFee, tFee);
+        takeTeam(tTeam);
+        reflectFee(rFee, tFee);
         emit Transfer(sender, recipient, tTransferAmount);
     }
 
-    function _takeTeam(uint256 tTeam) private {
-        uint256 currentRate = _getRate();
+    function transferFromExcluded(
+        address sender,
+        address recipient,
+        uint256 tAmount
+    ) private {
+        (
+            uint256 rAmount,
+            uint256 rTransferAmount,
+            uint256 rFee,
+            uint256 tTransferAmount,
+            uint256 tFee,
+            uint256 tTeam
+        ) = getValues(tAmount);
+        _tOwned[sender] = _tOwned[sender].sub(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
+        takeTeam(tTeam);
+        reflectFee(rFee, tFee);
+        emit Transfer(sender, recipient, tTransferAmount);
+    }
+
+    function transferBothExcluded(
+        address sender,
+        address recipient,
+        uint256 tAmount
+    ) private {
+        (
+            uint256 rAmount,
+            uint256 rTransferAmount,
+            uint256 rFee,
+            uint256 tTransferAmount,
+            uint256 tFee,
+            uint256 tTeam
+        ) = getValues(tAmount);
+        _tOwned[sender] = _tOwned[sender].sub(tAmount);
+        _rOwned[sender] = _rOwned[sender].sub(rAmount);
+        _tOwned[recipient] = _tOwned[recipient].add(tTransferAmount);
+        _rOwned[recipient] = _rOwned[recipient].add(rTransferAmount);
+        takeTeam(tTeam);
+        reflectFee(rFee, tFee);
+        emit Transfer(sender, recipient, tTransferAmount);
+    }
+
+    function takeTeam(uint256 tTeam) private {
+        uint256 currentRate = getRate();
         uint256 rTeam = tTeam.mul(currentRate);
         _rOwned[address(this)] = _rOwned[address(this)].add(rTeam);
         if (_isExcluded[address(this)]) _tOwned[address(this)] = _tOwned[address(this)].add(tTeam);
     }
 
-    function _reflectFee(uint256 rFee, uint256 tFee) private {
+    function reflectFee(uint256 rFee, uint256 tFee) private {
         _rTotal = _rTotal.sub(rFee);
         _tFeeTotal = _tFeeTotal.add(tFee);
     }
 
     receive() external payable {}
 
-    function _getValues(uint256 tAmount)
+    function getValues(uint256 tAmount)
         private
         view
         returns (
@@ -1312,13 +1316,13 @@ contract MSC is Context, IERC20, Ownable {
             uint256
         )
     {
-        (uint256 tTransferAmount, uint256 tFee, uint256 tTeam) = _getTValues(tAmount, _taxFee, _projectFee);
-        uint256 currentRate = _getRate();
-        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee) = _getRValues(tAmount, tFee, tTeam, currentRate);
+        (uint256 tTransferAmount, uint256 tFee, uint256 tTeam) = getTValues(tAmount, _taxFee, _projectFee);
+        uint256 currentRate = getRate();
+        (uint256 rAmount, uint256 rTransferAmount, uint256 rFee) = getRValues(tAmount, tFee, tTeam, currentRate);
         return (rAmount, rTransferAmount, rFee, tTransferAmount, tFee, tTeam);
     }
 
-    function _getTValues(
+    function getTValues(
         uint256 tAmount,
         uint8 taxFee,
         uint8 projectFee
@@ -1337,7 +1341,7 @@ contract MSC is Context, IERC20, Ownable {
         return (tTransferAmount, tFee, tTeam);
     }
 
-    function _getRValues(
+    function getRValues(
         uint256 tAmount,
         uint256 tFee,
         uint256 tTeam,
@@ -1358,12 +1362,12 @@ contract MSC is Context, IERC20, Ownable {
         return (rAmount, rTransferAmount, rFee);
     }
 
-    function _getRate() private view returns (uint256) {
-        (uint256 rSupply, uint256 tSupply) = _getCurrentSupply();
+    function getRate() private view returns (uint256) {
+        (uint256 rSupply, uint256 tSupply) = getCurrentSupply();
         return rSupply.div(tSupply);
     }
 
-    function _getCurrentSupply() private view returns (uint256, uint256) {
+    function getCurrentSupply() private view returns (uint256, uint256) {
         uint256 rSupply = _rTotal;
         uint256 tSupply = TOTAL;
         for (uint256 i = 0; i < _excluded.length; i++) {
@@ -1375,32 +1379,37 @@ contract MSC is Context, IERC20, Ownable {
         return (rSupply, tSupply);
     }
 
-    function _setTaxFee(uint8 taxFee) external onlyOwner {
+    function setTaxFee(uint8 taxFee) external onlyOwner {
         require(taxFee <= 6, "taxFee should be in 0 - 6");
         _taxFee = taxFee;
+        emit FeeUpdated("tax", taxFee);
     }
 
-    function _setProjectFee(uint8 projectFee) external onlyOwner {
+    function setProjectFee(uint8 projectFee) external onlyOwner {
         require(projectFee <= 12, "projectFee should be in 0 - 12");
         _projectFee = projectFee;
+        emit FeeUpdated("project", projectFee);
     }
 
-    function _setFundWallet(address payable fundWalletAddress) external onlyOwner {
+    function setFundWallet(address payable fundWalletAddress) external onlyOwner {
         require(fundWalletAddress != address(0), "address can bot be zero address");
         _fundWalletAddress = fundWalletAddress;
+        emit WalletAddressUpdated("fund", fundWalletAddress);
     }
 
-    function _setMarketingWallet(address payable marketingWalletAddress) external onlyOwner {
+    function setMarketingWallet(address payable marketingWalletAddress) external onlyOwner {
         require(marketingWalletAddress != address(0), "address can bot be zero address");
         _marketingWalletAddress = marketingWalletAddress;
+        emit WalletAddressUpdated("marketing", marketingWalletAddress);
     }
 
-    function _setLiquidityWallet(address payable liquidityWalletAddress) external onlyOwner {
+    function setLiquidityWallet(address payable liquidityWalletAddress) external onlyOwner {
         require(liquidityWalletAddress != address(0), "address can bot be zero address");
         _liquidityWalletAddress = liquidityWalletAddress;
+        emit WalletAddressUpdated("liquidity", liquidityWalletAddress);
     }
 
-    function _updateAllocations(
+    function updateAllocations(
         uint8 marketingAllocation,
         uint8 fundAllocation,
         uint8 liquidityAllocation
@@ -1414,39 +1423,38 @@ contract MSC is Context, IERC20, Ownable {
         _liquidityAllocation = liquidityAllocation;
     }
 
-    function _setMaxTxAmount(uint256 maxTxAmount) external onlyOwner {
+    function setMaxTxAmount(uint256 maxTxAmount) external onlyOwner {
         require(maxTxAmount >= 1 * 10**6 * 10**9, "maxTxAmount should be greater or equal 1 * 10**6 * 10**9");
         _maxTxAmount = maxTxAmount;
-    }
-
-    function setUniswapV2Pair(address _uniswapV2Pair) public onlyOwner {
-        uniswapV2Pair = _uniswapV2Pair;
+        emit MaxTxAmountUpdated(maxTxAmount);
     }
 
     function isUniswapPair(address _pair) external view returns (bool) {
-        if (_pair == uniswapV2Pair) return true;
         return _isUniswapPair[_pair];
     }
 
-    function addUniswapPair(address _pair) external onlyOwner {
-        _isUniswapPair[_pair] = true;
+    function addUniswapPair(address pair) public onlyOwner {
+        _isUniswapPair[pair] = true;
+        emit AddUniswapV2Pair(pair);
     }
 
-    function removeUniswapPair(address _pair) external onlyOwner {
-        _isUniswapPair[_pair] = false;
+    function removeUniswapPair(address pair) public onlyOwner {
+        _isUniswapPair[pair] = false;
+        emit RemoveUniswapV2Pair(pair);
     }
 
     function minimumTokensBeforeSwapAmount() external view returns (uint256) {
-        return minimumTokensBeforeSwap;
+        return _minimumTokensBeforeSwap;
     }
 
-    function setMinimumTokensBeforeSwap(uint256 _minimumTokensBeforeSwap) external onlyOwner {
-        minimumTokensBeforeSwap = _minimumTokensBeforeSwap;
+    function setMinimumTokensBeforeSwap(uint256 minimumTokensBeforeSwap) external onlyOwner {
+        _minimumTokensBeforeSwap = minimumTokensBeforeSwap;
+        emit MinimumTokensBeforeSwapUpdated(minimumTokensBeforeSwap);
     }
 
-    function afterLiquidityAdded(address _uniswapV2Pair) external onlyOwner {
-        setUniswapV2Pair(_uniswapV2Pair);
-        excludeAccount(_uniswapV2Pair);
-        swapEnabled = true;
+    function afterLiquidityAdded(address pair) external onlyOwner {
+        addUniswapPair(pair);
+        excludeAccount(pair);
+        setSwapEnabled(true);
     }
 }
